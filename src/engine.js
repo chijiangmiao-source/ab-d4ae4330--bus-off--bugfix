@@ -16,7 +16,9 @@
  *
  * 错误计数：发送/接收方检出错误 TEC/REC +8；正常完成 -1（下限 0）。
  * TEC>=128 或 REC>=128 错误被动；TEC>=256 bus-off。
- * bus-off 节点不参与后续仲裁、新请求拒绝；监测到 128 次 11 连续隐性位序列后恢复并清零。
+ * bus-off 节点不参与后续仲裁、不应答、新请求拒绝；
+ * 各节点自其进入 bus-off 的时刻起独立累计 128 次 11 连续隐性位序列，满足后恢复并清零；
+ * 他节点显性流量只打断当前 11 位序列，不抹除已完成的恢复组。
  */
 (function (root, factory) {
   const api = factory();
@@ -183,8 +185,9 @@
     const segments = [];
     let frameSeg = null, idleSeg = null;
     let t = 0, attemptSeq = 0;
+    // 每个 bus-off 节点各自独立累计恢复进度：
+    // name -> { enteredAt, groups, partial }，自其进入 bus-off 的位时刻起算
     const recovery = new Map();
-    const recoveryClock = { groups: 0, partial: 0, startedAt: null };
 
     function beginIdle() {
       if (!idleSeg) { idleSeg = { type: 'idle', startBit: t, bits: [] }; segments.push(idleSeg); }
@@ -198,25 +201,28 @@
 
     function recoveryTick(bit) {
       if (!recovery.size) return;
-      if (bit === REC) {
-        recoveryClock.partial++;
-        if (recoveryClock.partial === RECOVERY_GROUP_LEN) {
-          recoveryClock.partial = 0;
-          recoveryClock.groups++;
+      const done = [];
+      for (const [name, rec] of recovery) {
+        if (bit === REC) {
+          rec.partial++;
+          if (rec.partial === RECOVERY_GROUP_LEN) {
+            rec.partial = 0;
+            rec.groups++;
+          }
+        } else {
+          // 显性位只打断当前 11 位序列，已完成的恢复组保留
+          rec.partial = 0;
         }
-      } else {
-        recoveryClock.partial = 0;
+        if (rec.groups >= RECOVERY_GROUPS) done.push(name);
       }
-      if (recoveryClock.groups < RECOVERY_GROUPS) return;
-      for (const name of recovery.keys()) {
+      // 恢复边界与各自进入 bus-off 的时刻对齐：先满足自身 128×11 者先恢复
+      for (const name of done) {
+        const rec = recovery.get(name);
+        recovery.delete(name);
         const s = st.get(name);
         s.tec = 0; s.rec = 0; s.mode = 'active'; s.busOffAt = null;
-        events.push({ type: 'recovered', node: name, atBit: t, groups: recoveryClock.groups, startedAtBit: recoveryClock.startedAt });
+        events.push({ type: 'recovered', node: name, atBit: t, groups: rec.groups, startedAtBit: rec.enteredAt });
       }
-      recovery.clear();
-      recoveryClock.groups = 0;
-      recoveryClock.partial = 0;
-      recoveryClock.startedAt = null;
     }
 
     function emit(fieldName, label, bus, drives, note) {
@@ -254,9 +260,9 @@
       if (s.mode === 'bus-off') return;
       s.mode = 'bus-off';
       s.busOffAt = atBit;
-      recovery.set(name, { enteredAt: atBit });
-      if (recoveryClock.startedAt === null) recoveryClock.startedAt = atBit;
-      events.push({ type: 'bus-off', node: name, atBit, tec: s.tec, recoveryStartedAt: recoveryClock.startedAt });
+      // 恢复监测自本节点进入 bus-off 的位时刻独立起算，不与其他 bus-off 节点共享
+      recovery.set(name, { enteredAt: atBit, groups: 0, partial: 0 });
+      events.push({ type: 'bus-off', node: name, atBit, tec: s.tec, recoveryStartedAt: atBit });
       for (const req of pending) {
         if (req.node === name && outcomes[req.index].status !== 'rejected') {
           outcomes[req.index].status = 'waiting-busoff';

@@ -272,9 +272,9 @@ function eventText(ev, r) {
     case 'error-passive':
       return `⚪ <b>${escapeHtml(ev.node)}</b> 在 ${at} 进入<b>错误被动</b>（TEC=${ev.tec}${ev.rec ? `，REC=${ev.rec}` : ''}），错误标志转为 6 个隐性位`;
     case 'bus-off':
-      return `🔴 <b>${escapeHtml(ev.node)}</b> 在 ${at} TEC=${ev.tec} 达到 256，进入 <b>bus-off</b>：退出仲裁，新请求被拒绝，等待 128×11 连续隐性位`;
+      return `🔴 <b>${escapeHtml(ev.node)}</b> 在 ${at} TEC=${ev.tec} 达到 256，进入 <b>bus-off</b>：退出仲裁、不应答，新请求被拒绝，<b>自位 ${ev.recoveryStartedAt} 起</b>独立监测 128×11 连续隐性位`;
     case 'recovered':
-      return `🟢 <b>${escapeHtml(ev.node)}</b> 在 ${at} 完成 ${ev.groups} 次 11 连续隐性位监测，<b>恢复发送资格</b>，TEC/REC 清零`;
+      return `🟢 <b>${escapeHtml(ev.node)}</b> 在 ${at} 完成自位 ${ev.startedAtBit} 起独立累计的 ${ev.groups} 次 11 连续隐性位监测，<b>恢复发送资格</b>，TEC/REC 清零，挂起请求自此重传`;
     case 'rejected':
       return `⛔ ${at} 节点 <b>${escapeHtml(ev.node)}</b> 的请求 #${ev.requestIndex} 被<b>拒绝</b>（bus-off）`;
     case 'aborted':

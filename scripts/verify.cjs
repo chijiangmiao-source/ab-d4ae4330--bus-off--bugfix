@@ -5,7 +5,8 @@
  *   阶段 1  node --test 全量代码测试（仲裁 / 填充 / CRC / ACK / 被动错误 / bus-off 恢复 / 字段校验）
  *   阶段 2  构建检查（语法 + 页面资源 + dist 产出）
  *   阶段 3  启动真实 HTTP 服务，健康检查与页面资源冒烟
- *   阶段 4  通过 HTTP API 验证三类可观察结果：正常仲裁 / 被动错误 / bus-off 恢复
+ *   阶段 4  通过 HTTP API 验证四类可观察结果：
+ *           正常仲裁 / 被动错误 / 单节点 bus-off 恢复 / 两节点先后 bus-off 各自独立恢复
  *
  * 任一阶段失败即以非零码退出，退出码如实反映验收结果。
  */
@@ -185,7 +186,54 @@ async function main() {
         rec.atBit > off.atBit + 1408, `off=${off.atBit} rec=${rec.atBit}`);
     }
 
-    section('阶段 4d：非法输入字段级反馈（并确认不产生结论）');
+    section('阶段 4d：两节点先后 bus-off（恢复资格按各自进入时刻独立累计）');
+    const seq = await api({
+      nodes: [{ name: 'CAM-A', tec: 248 }, { name: 'CAM-B', tec: 248 }, { name: 'RADAR', tec: 0 }],
+      requests: [
+        { time: 0, node: 'CAM-A', id: '0x100', dlc: 1, data: '00', error: { type: 'bit', dataBit: 0 } },
+        { time: 200, node: 'CAM-B', id: '0x200', dlc: 1, data: '00', error: { type: 'bit', dataBit: 0 } },
+      ],
+    });
+    check('API 返回 200', seq.status === 200);
+    {
+      const r = seq.body;
+      const offs = r.events.filter((e) => e.type === 'bus-off');
+      const offA = offs.find((e) => e.node === 'CAM-A');
+      const offB = offs.find((e) => e.node === 'CAM-B');
+      check('CAM-A、CAM-B 先后进入 bus-off', offs.length === 2 && offA.atBit < offB.atBit,
+        JSON.stringify(offs));
+      check('各自恢复监测起点对齐各自进入位',
+        offA.recoveryStartedAt === offA.atBit && offB.recoveryStartedAt === offB.atBit);
+      const recs = r.events.filter((e) => e.type === 'recovered');
+      const recA = recs.find((e) => e.node === 'CAM-A');
+      const recB = recs.find((e) => e.node === 'CAM-B');
+      check('两个恢复事件先后有序且位位置不同', recs.length === 2 && recA.atBit < recB.atBit,
+        `A=${recA?.atBit} B=${recB?.atBit}`);
+      check('恢复事件起点与各自 bus-off 边界一致',
+        recA.startedAtBit === offA.atBit && recB.startedAtBit === offB.atBit);
+      check('较晚节点自其进入位独立累计满 128×11 隐性位',
+        recB.groups === 128 && recB.atBit - offB.atBit >= 1408,
+        `跨度=${recB.atBit - offB.atBit}`);
+      const winBits = r.segments.flatMap((s) => s.bits).filter((b) => b.i >= offB.atBit && b.i < recB.atBit);
+      check('较晚节点恢复窗口内隐性位不少于 1408 且含显性打断（已完成组不被抹除）',
+        winBits.filter((b) => b.bus === 1).length >= 1408 && winBits.some((b) => b.bus === 0));
+      const mid = r.attempts.filter((a) => a.startBit >= offB.atBit && a.startBit < recB.atBit);
+      check('较晚节点恢复前不参与仲裁/不应答/不发送',
+        mid.every((a) => a.winner !== 'CAM-B' && !a.trace.some((b) => b.drives && b.drives['CAM-B'] !== undefined)));
+      const retxA = r.attempts.find((a) => a.winner === 'CAM-A' && a.retransmit && a.ok);
+      const retxB = r.attempts.find((a) => a.winner === 'CAM-B' && a.retransmit && a.ok);
+      check('先恢复节点在较晚节点恢复前完成重传', !!retxA && retxA.startBit >= recA.atBit - 3 && retxA.startBit < recB.atBit);
+      check('挂起请求的重传起点与自身恢复边界一致', !!retxB && retxB.startBit >= recB.atBit - 3,
+        `retx=${retxB?.startBit} rec=${recB.atBit}`);
+      check('两条挂起请求最终均重传成功', r.requests.every((q) => q.status === 'transmitted'));
+      check('两节点恢复后 TEC/REC 清零且为主动模式',
+        ['CAM-A', 'CAM-B'].every((n) => {
+          const s = r.nodes.find((x) => x.name === n);
+          return s.tec === 0 && s.rec === 0 && s.mode === 'active';
+        }));
+    }
+
+    section('阶段 4e：非法输入字段级反馈（并确认不产生结论）');
     const bad = await api({
       nodes: [{ name: 'A' }],
       requests: [{ node: 'A', id: '0x800', dlc: 2, data: [1, 2, 3], error: { type: 'bit', dataBit: 99 } }],

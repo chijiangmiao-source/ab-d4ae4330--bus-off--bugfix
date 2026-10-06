@@ -272,6 +272,75 @@ test('bus-off 恢复期间显性流量打断连续 11 位计数但不抹除已�
   assert.ok(r.attempts.some((a) => a.winner === 'A' && a.status === 'acknowledged' && a.startBit >= rec.atBit - 3));
 });
 
+test('先后 bus-off：较晚节点自其进入时刻独立累计 128×11，恢复边界与重传各自对齐', () => {
+  // A、B 初始 TEC 均接近 bus-off 阈值，C 保持正常；
+  // A 先因数据位错误 bus-off，A 恢复监测未完成时 B 也因数据位错误 bus-off
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 248 }, { name: 'B', tec: 248 }, { name: 'C', tec: 0 }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 1, data: [0], error: { type: 'bit', dataBit: 0 } },
+      { time: 200, node: 'B', id: '0x200', dlc: 1, data: [0], error: { type: 'bit', dataBit: 0 } },
+    ],
+  });
+  assert.ok(r.ok);
+
+  // 两个 bus-off 事件：先后进入，各自的恢复监测起点对齐各自进入位
+  const offs = r.events.filter((e) => e.type === 'bus-off');
+  assert.equal(offs.length, 2);
+  const offA = offs.find((e) => e.node === 'A');
+  const offB = offs.find((e) => e.node === 'B');
+  assert.ok(offA.atBit < offB.atBit);
+  assert.equal(offA.recoveryStartedAt, offA.atBit);
+  assert.equal(offB.recoveryStartedAt, offB.atBit);
+
+  // 两个恢复事件：先进入者先恢复，位位置不同；各自起点与自身 bus-off 边界一致
+  const recs = r.events.filter((e) => e.type === 'recovered');
+  assert.equal(recs.length, 2);
+  const recA = recs.find((e) => e.node === 'A');
+  const recB = recs.find((e) => e.node === 'B');
+  assert.ok(recA.atBit < recB.atBit, `A(${recA.atBit}) 应先于 B(${recB.atBit}) 恢复`);
+  assert.equal(recA.groups, 128);
+  assert.equal(recB.groups, 128);
+  assert.equal(recA.startedAtBit, offA.atBit);
+  assert.equal(recB.startedAtBit, offB.atBit);
+
+  // 较晚节点 B 的独立恢复长度：自 B 进入 bus-off 起完整累计 128×11 个隐性位
+  assert.ok(recB.atBit - offB.atBit >= 128 * 11,
+    `B 的恢复跨度 ${recB.atBit - offB.atBit} 应不少于 1408 位`);
+  const winBits = r.segments.flatMap((s) => s.bits).filter((b) => b.i >= offB.atBit && b.i < recB.atBit);
+  const recessive = winBits.filter((b) => b.bus === 1);
+  assert.ok(recessive.length >= 128 * 11, `B 恢复窗口内隐性位 ${recessive.length} 应不少于 1408`);
+  // 窗口内存在他节点（A 恢复后重传）的显性流量：只打断当前序列，未抹除 B 已完成组
+  assert.ok(winBits.some((b) => b.bus === 0), 'B 恢复期间应存在显性流量打断');
+  assert.ok(r.attempts.some((a) => a.winner === 'A' && a.ok && a.startBit >= recA.atBit - 3 && a.startBit < recB.atBit),
+    'A 应在 B 仍处 bus-off 期间完成自身重传');
+
+  // B 在自身恢复前不得参与仲裁、确认帧或发送挂起请求
+  for (const a of r.attempts) {
+    if (a.startBit >= offB.atBit && a.startBit < recB.atBit) {
+      assert.notEqual(a.winner, 'B', 'B 在 bus-off 期间不得获胜仲裁');
+      assert.ok(!a.trace.some((b) => b.drives && b.drives.B !== undefined),
+        `帧尝试 #${a.index} 中 B 不得驱动任何位（含 ACK）`);
+    }
+  }
+
+  // 挂起请求的重传时机与各自恢复边界一致
+  const retxA = r.attempts.find((a) => a.winner === 'A' && a.retransmit && a.ok);
+  const retxB = r.attempts.find((a) => a.winner === 'B' && a.retransmit && a.ok);
+  assert.ok(retxA.startBit >= recA.atBit - 3 && retxA.startBit < recB.atBit);
+  assert.ok(retxB.startBit >= recB.atBit - 3, `B 的重传起点 ${retxB.startBit} 应对齐自身恢复位 ${recB.atBit}`);
+
+  // 两条挂起请求最终均重传成功，两节点计数清零、恢复主动模式
+  assert.equal(r.requests.find((q) => q.node === 'A').status, 'transmitted');
+  assert.equal(r.requests.find((q) => q.node === 'B').status, 'transmitted');
+  for (const name of ['A', 'B']) {
+    const n = r.nodes.find((x) => x.name === name);
+    assert.equal(n.tec, 0);
+    assert.equal(n.rec, 0);
+    assert.equal(n.mode, 'active');
+  }
+});
+
 test('字段级校验：非法标识、载荷超 DLC、无效错误位置均被拒绝并带字段路径', () => {
   const cases = [
     [{ nodes: [{ name: 'A' }], requests: [{ node: 'A', id: '0x800', dlc: 0 }] }, 'requests[0].id'],
