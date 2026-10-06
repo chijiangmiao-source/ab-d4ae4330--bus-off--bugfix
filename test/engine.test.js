@@ -272,6 +272,95 @@ test('bus-off 恢复期间显性流量打断连续 11 位计数但不抹除已�
   assert.ok(r.attempts.some((a) => a.winner === 'A' && a.status === 'acknowledged' && a.startBit >= rec.atBit - 3));
 });
 
+/** 从回放位流独立复算某节点的恢复位位置：自其 bus-off 时刻起累计 128 次 11 连续隐性位 */
+function recountRecoveryAt(result, nodeName) {
+  const off = result.events.find((e) => e.type === 'bus-off' && e.node === nodeName);
+  assert.ok(off, `缺少 ${nodeName} 的 bus-off 事件`);
+  const bits = new Map();
+  for (const seg of result.segments) for (const b of seg.bits) bits.set(b.i, b.bus);
+  let groups = 0, partial = 0, i = off.atBit;
+  while (groups < 128) {
+    const bus = bits.get(i);
+    assert.ok(bus !== undefined, `位流缺少位 ${i}`);
+    if (bus === 1) { partial++; if (partial === 11) { partial = 0; groups++; } }
+    else partial = 0; // 显性位只打断当前 11 位序列，已累计组数保留
+    i++;
+  }
+  return { off, recoveredAt: i };
+}
+
+test('双节点先后 bus-off：各自独立累计 128×11，恢复与重传以各自边界为准', () => {
+  const r = Can.simulate({
+    nodes: [{ name: 'A', tec: 248 }, { name: 'B', tec: 248 }, { name: 'C', tec: 0 }],
+    requests: [
+      { time: 0, node: 'A', id: '0x100', dlc: 1, data: [0], error: { type: 'bit', dataBit: 0 } },   // A：248+8=256 → bus-off
+      { time: 300, node: 'B', id: '0x200', dlc: 1, data: [0], error: { type: 'bit', dataBit: 0 } }, // A 监测期间 B 也 bus-off
+      { time: 1600, node: 'C', id: '0x300', dlc: 0 }, // B 恢复窗口内他节点显性流量（A 已恢复并应答）
+    ],
+  });
+  assert.ok(r.ok);
+
+  const offA = r.events.find((e) => e.type === 'bus-off' && e.node === 'A');
+  const offB = r.events.find((e) => e.type === 'bus-off' && e.node === 'B');
+  const recA = r.events.find((e) => e.type === 'recovered' && e.node === 'A');
+  const recB = r.events.find((e) => e.type === 'recovered' && e.node === 'B');
+  assert.ok(offA && offB && recA && recB, '应各有一次 bus-off 与 recovered 事件');
+
+  // 先后次序与各自独立的监测起点
+  assert.ok(offA.atBit < offB.atBit, 'A 先于 B 进入 bus-off');
+  assert.ok(offB.atBit < recA.atBit, 'B 进入 bus-off 时 A 尚未完成恢复监测');
+  assert.ok(recA.atBit < recB.atBit, 'A 先恢复，B 必须继续保持 bus-off 直至自身累计完成');
+  assert.equal(recA.startedAtBit, offA.atBit);
+  assert.equal(recB.startedAtBit, offB.atBit); // B 的恢复监测自 B 自身 bus-off 时刻起算
+  assert.equal(offB.recoveryStartedAt, offB.atBit);
+
+  // 恢复位位置与位流独立复算一致（128×11 连续隐性位，显性只打断当前序列）
+  assert.equal(recA.atBit, recountRecoveryAt(r, 'A').recoveredAt);
+  assert.equal(recB.atBit, recountRecoveryAt(r, 'B').recoveredAt);
+
+  // 较晚节点 B 的独立恢复长度：自 B 进入 bus-off 起满 128×11 个隐性位（不含 A 监测期的任何部分）
+  const recBitsB = r.segments.flatMap((s) => s.bits).filter((b) => b.i >= offB.atBit && b.i < recB.atBit);
+  assert.ok(recBitsB.filter((b) => b.bus === 1).length >= 128 * 11, 'B 须亲自观察满 128×11 个隐性位');
+  assert.ok(recB.atBit - offB.atBit >= 128 * 11);
+  assert.ok(recB.atBit > recA.atBit, 'B 不得随 A 的全局时钟同时恢复');
+  assert.ok(recBitsB.some((b) => b.bus === 0), 'B 的恢复窗口内确有他节点显性流量（仅打断当前序列）');
+
+  // B 在自身恢复边界之前：不参与仲裁、不确认帧、不发送挂起请求
+  for (const b of r.segments.flatMap((s) => s.bits)) {
+    if (b.i >= offB.atBit && b.i < recB.atBit && b.drives) {
+      assert.ok(!('B' in b.drives), `位 ${b.i}（${b.label}）不应出现 B 驱动总线`);
+    }
+  }
+  assert.ok(!r.attempts.some((a) => a.winner === 'B' && a.startBit >= offB.atBit && a.startBit < recB.atBit),
+    'B 进入 bus-off 后、自身恢复前不得赢得仲裁');
+
+  // 挂起请求的重传起点与 B 自身恢复边界一致（而非 A 的）
+  const retxB = r.attempts.find((a) => a.winner === 'B' && a.ok);
+  assert.ok(retxB, 'B 的挂起请求应在恢复后重传');
+  assert.equal(retxB.startBit, recB.atBit);
+  assert.ok(retxB.retransmit);
+  assert.equal(r.requests.find((q) => q.node === 'B').status, 'transmitted');
+  // A 的挂起请求在 A 自身恢复边界重传
+  const retxA = r.attempts.find((a) => a.winner === 'A' && a.ok);
+  assert.equal(retxA.startBit, recA.atBit);
+
+  // 错误计数清零与各自恢复边界一致：B 恢复前的帧不计 B 的计数，恢复后重传时 B 已从 0 起算
+  for (const a of r.attempts) {
+    if (a.startBit >= offB.atBit && a.startBit < recB.atBit) {
+      assert.ok(!a.counterChanges.some((c) => c.node === 'B'), `帧 #${a.index} 不应触及 B 的错误计数`);
+    }
+  }
+  const bInRetx = retxB.counterChanges.find((c) => c.node === 'B');
+  assert.equal(bInRetx.tecBefore, 0, 'B 重传时 TEC 已在自身恢复边界清零');
+  const B = r.nodes.find((n) => n.name === 'B');
+  assert.equal(B.tec, 0);
+  assert.equal(B.rec, 0);
+  assert.equal(B.mode, 'active');
+  const A = r.nodes.find((n) => n.name === 'A');
+  assert.equal(A.tec, 0);
+  assert.equal(A.mode, 'active');
+});
+
 test('字段级校验：非法标识、载荷超 DLC、无效错误位置均被拒绝并带字段路径', () => {
   const cases = [
     [{ nodes: [{ name: 'A' }], requests: [{ node: 'A', id: '0x800', dlc: 0 }] }, 'requests[0].id'],

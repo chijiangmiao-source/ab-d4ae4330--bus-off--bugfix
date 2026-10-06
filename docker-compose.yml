@@ -18,7 +18,8 @@ services:
     restart: unless-stopped
 
   # 一次性验收服务：代码测试 + 构建检查 + 页面/健康 HTTP 冒烟 +
-  # 正常仲裁 / 被动错误 / bus-off 恢复三类可观察结果；结束即退出，退出码反映验收结果。
+  # 正常仲裁 / 被动错误 / 单节点 bus-off 恢复 / 双节点先后 bus-off 独立恢复 / 非法输入反馈；
+  # 结束即退出，退出码反映验收结果。
   # 运行：docker compose build verify && docker compose run --rm verify
   verify:
     build:
